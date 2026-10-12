@@ -2,14 +2,13 @@
 # -*- coding: utf-8 -*-
 """Global settings and constants.
 
-Directories can be overridden via the environment variables
-``SPLICE_GTF_CACHE_DIR`` / ``SPLICE_ALLGTF_DIR``.
+The GTF cache directory can be overridden via the environment variable
+``SPLICE_GTF_CACHE_DIR``.
 """
 
 import os
 
 GTF_CACHE_DIR = os.environ.get('SPLICE_GTF_CACHE_DIR', './gtf_cache')
-ALLGTF_DIR = os.environ.get('SPLICE_ALLGTF_DIR', '/mnt/g/bioinfo/refer/Allgtf')
 
 # Maximum 3'UTR extension downstream of the CDS when searching for a stop codon
 ALT_DOWNSTREAM_EXTENSION_BP = 1500

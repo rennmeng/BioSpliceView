@@ -19,7 +19,7 @@ from Bio.Seq import Seq
 from openpyxl.styles import Alignment
 
 from . import console, settings
-from .alt_isoform import compute_alt_from_ref
+from .alt_isoform import build_alt_exon_chain, compute_alt_from_ref
 from .events import (
     ANNOTATION_COLUMNS,
     RMATS_COORD_COLS,
@@ -29,7 +29,7 @@ from .events import (
 from .genbank_output import generate_exon_gb, generate_tran_gb
 from .gtf_index import build_gtf_index, build_gtf_index_with_cache
 from .matching import anchor_ref_transcript
-from .nmd import _get_start_codon_position, judge_nmd_status
+from .nmd import _get_start_codon_position, absolute_nmd_status, judge_nmd_status
 from .sequences import (
     _compute_trimmed_diff,
     _starts_with_atg,
@@ -90,23 +90,25 @@ def _build_all_significant_row(df_filt, annot_df, etype, global_counter_start=0)
 
 
 def process_event(row, etype, genome, gene_idx, gene_exons, tid_strand, alias_map,
-                  longest_tx_per_gene, gb_output_dir=None, event_id="", job_id=None):
+                  longest_tx_per_gene, tid_biotype=None, gb_output_dir=None, event_id="", job_id=None):
     res = {col: '' for col in ANNOTATION_COLUMNS}
     try:
         chrom = row['chr']
         gene_id = str(row.get('GeneID', row.get('geneSymbol', ''))).strip()
         if not gene_id:
-            res['Match_Status'] = "[LEVEL0] ERROR: No GeneID/Symbol"
+            res['Match_Status'] = "UNANCHORED(ERROR: No GeneID/Symbol)"
             return res
 
         ref_tid, ref_cds_raw, exon_bounds, strand, diag_msg = anchor_ref_transcript(
-            row, etype, gene_id, gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene)
+            row, etype, gene_id, gene_idx, gene_exons, tid_strand, alias_map,
+            longest_tx_per_gene, tid_biotype)
 
         if not ref_tid or not exon_bounds:
-            res['Match_Status'] = diag_msg or "[LEVEL0] UNKNOWN_MATCH_FAILURE"
+            res['Match_Status'] = diag_msg or "UNANCHORED(UNKNOWN_MATCH_FAILURE)"
             return res
 
         res['Ref_Transcript_ID'] = ref_tid
+        res['Anchor_Biotype'] = (tid_biotype or {}).get(ref_tid, '')
         res['Match_Status'] = diag_msg
 
         raw_gene_symbol = str(row.get('geneSymbol', '')).strip()
@@ -118,7 +120,9 @@ def process_event(row, etype, genome, gene_idx, gene_exons, tid_strand, alias_ma
             full_tx_exons = exon_bounds
 
         if ref_cds_raw:
-            ref_cds_ph_ext = extend_cds_with_3utr(ref_cds_raw, genome, chrom, strand, settings.ALT_DOWNSTREAM_EXTENSION_BP)
+            ref_cds_ph_ext = extend_cds_with_3utr(ref_cds_raw, genome, chrom, strand,
+                                                  settings.ALT_DOWNSTREAM_EXTENSION_BP,
+                                                  full_tx_exons)
             ref_cds_seq = get_coding_sequence(ref_cds_ph_ext, genome, chrom, strand)
             ref_prot_full = str(Seq(ref_cds_seq).translate(to_stop=False)) if ref_cds_seq else ""
             sp = ref_prot_full.find('*')
@@ -131,8 +135,13 @@ def process_event(row, etype, genome, gene_idx, gene_exons, tid_strand, alias_ma
             res['Ref_CDS_Length'] = len(ref_cds_seq_trunc)
             start_codon_pos = _get_start_codon_position(ref_cds_ph_trunc, strand)
 
-            alt_cds_ph_base = compute_alt_from_ref(ref_cds_raw, row, etype, strand)
-            alt_cds_ph_ext = extend_cds_with_3utr(alt_cds_ph_base, genome, chrom, strand, settings.ALT_DOWNSTREAM_EXTENSION_BP)
+            alt_cds_ph_base = compute_alt_from_ref(ref_cds_raw, row, etype, strand,
+                                                    full_tx_exons)
+            # 替代异构体的外显子链：用于拼接感知的 3' 延伸与 NMD 判定
+            alt_tx_exons = build_alt_exon_chain(full_tx_exons, row, etype) or full_tx_exons
+            alt_cds_ph_ext = extend_cds_with_3utr(alt_cds_ph_base, genome, chrom, strand,
+                                                  settings.ALT_DOWNSTREAM_EXTENSION_BP,
+                                                  alt_tx_exons)
             alt_cds_seq = get_coding_sequence(alt_cds_ph_ext, genome, chrom, strand)
 
             if not _starts_with_atg(alt_cds_seq):
@@ -143,6 +152,9 @@ def process_event(row, etype, genome, gene_idx, gene_exons, tid_strand, alias_ma
                 res['Diff_Protein'] = ''
                 res['Diff_Length'] = ''
                 res['NMD_Status'] = 'NO_START_CODON'
+                res['Alt_Absolute_NMD'] = 'NO_START_CODON'
+                res['Ref_Absolute_NMD'] = absolute_nmd_status(
+                    ref_prot_trunc, ref_cds_ph_trunc, full_tx_exons, strand, start_codon_pos)
                 base_status = diag_msg
                 res['Match_Status'] = f"{base_status};ALT_NO_START_CODON"
             else:
@@ -164,21 +176,35 @@ def process_event(row, etype, genome, gene_idx, gene_exons, tid_strand, alias_ma
 
                 frameshift = _is_frameshift_by_event(etype, row, ref_cds_ph=ref_cds_ph_trunc, strand=strand)
 
+                # NMD_Status: whether the EVENT introduces a PTC (paper semantics);
+                # *_Absolute_NMD: each isoform's own stop-codon NMD assessment,
+                # so isoforms already NMD in the annotation are reported as such.
                 res['NMD_Status'] = judge_nmd_status(
                     ref_prot_trunc,
                     alt_prot_trunc,
                     frameshift,
                     alt_cds_ph_trunc,
-                    full_tx_exons,
+                    alt_tx_exons,
                     strand,
                     start_codon_pos
                 )
+                res['Ref_Absolute_NMD'] = absolute_nmd_status(
+                    ref_prot_trunc, ref_cds_ph_trunc, full_tx_exons, strand, start_codon_pos)
+                res['Alt_Absolute_NMD'] = absolute_nmd_status(
+                    alt_prot_trunc, alt_cds_ph_trunc, alt_tx_exons, strand,
+                    start_codon_pos, premature_ptc=frameshift)
 
             if gb_output_dir:
+                gb_ctx = dict(nmd_status=res['NMD_Status'],
+                              ref_abs_nmd=res.get('Ref_Absolute_NMD', ''),
+                              alt_abs_nmd=res.get('Alt_Absolute_NMD', ''),
+                              anchor_biotype=res.get('Anchor_Biotype', ''))
                 generate_exon_gb(ref_tid, exon_bounds, ref_cds_ph_trunc, genome, chrom, strand,
-                                 display_gene_symbol, etype, row, gb_output_dir, job_id, event_id=event_id)
+                                 display_gene_symbol, etype, row, gb_output_dir, job_id,
+                                 event_id=event_id, context=gb_ctx)
                 generate_tran_gb(ref_tid, full_tx_exons, ref_cds_ph_trunc, genome, chrom, strand,
-                                 display_gene_symbol, etype, row, gb_output_dir, job_id, event_id=event_id)
+                                 display_gene_symbol, etype, row, gb_output_dir, job_id,
+                                 event_id=event_id, context=gb_ctx)
 
         else:
             res['Ref_Full_CDS'] = ''
@@ -191,20 +217,24 @@ def process_event(row, etype, genome, gene_idx, gene_exons, tid_strand, alias_ma
             res['Diff_Protein'] = ''
             res['Diff_Length'] = ''
             res['NMD_Status'] = 'NON_CODING'
+            res['Ref_Absolute_NMD'] = 'NON_CODING'
+            res['Alt_Absolute_NMD'] = 'NON_CODING'
             res['Match_Status'] = diag_msg
 
             if gb_output_dir:
                 generate_exon_gb(ref_tid, exon_bounds, [], genome, chrom, strand,
-                                 display_gene_symbol, etype, row, gb_output_dir, job_id, event_id=event_id)
+                                 display_gene_symbol, etype, row, gb_output_dir, job_id,
+                                 event_id=event_id)
                 generate_tran_gb(ref_tid, full_tx_exons, [], genome, chrom, strand,
-                                 display_gene_symbol, etype, row, gb_output_dir, job_id, event_id=event_id)
+                                 display_gene_symbol, etype, row, gb_output_dir, job_id,
+                                 event_id=event_id)
 
     except KeyError as e:
-        res['Match_Status'] = f"[LEVEL0] ERROR: Missing column {e}"
+        res['Match_Status'] = f"UNANCHORED(ERROR: Missing column {e})"
     except IndexError as e:
-        res['Match_Status'] = f"[LEVEL0] ERROR: Index out of range {e}"
+        res['Match_Status'] = f"UNANCHORED(ERROR: Index out of range {e})"
     except Exception as e:
-        res['Match_Status'] = f"[LEVEL0] ERROR: {type(e).__name__}: {e}"
+        res['Match_Status'] = f"UNANCHORED(ERROR: {type(e).__name__}: {e})"
         logger.debug(f"Event error: {e}", exc_info=True)
     return res
 
@@ -241,9 +271,9 @@ def filter_and_summarize(rmats_dir, output_dir, genome_file, gtf_file,
     genome = Fasta(genome_file, as_raw=True, sequence_always_upper=True)
     logger.info(f"GTF          : {gtf_file}")
     if use_cache:
-        gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene = build_gtf_index_with_cache(gtf_file, cache_dir)
+        gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene, tid_biotype = build_gtf_index_with_cache(gtf_file, cache_dir)
     else:
-        gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene = build_gtf_index(gtf_file)
+        gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene, tid_biotype = build_gtf_index(gtf_file)
     gtf_load_time = (datetime.now() - start_time).total_seconds()
     logger.info(f"✓ {len(genome.keys()):,} genome sequences ({len(genome):,} bp) · "
                 f"GTF index ready ({gtf_load_time:.1f}s)")
@@ -310,7 +340,8 @@ def filter_and_summarize(rmats_dir, output_dir, genome_file, gtf_file,
 
         for idx, (eid, (_, row)) in enumerate(zip(current_ids, df_filt.iterrows())):
             rec = process_event(row, etype, genome, gene_idx, gene_exons, tid_strand,
-                                alias_map, longest_tx_per_gene, gb_output_dir, event_id=str(eid), job_id=job_id)
+                                alias_map, longest_tx_per_gene, tid_biotype,
+                                gb_output_dir, event_id=str(eid), job_id=job_id)
             records.append(rec)
 
             if (idx + 1) % 100 == 0:
@@ -333,9 +364,9 @@ def filter_and_summarize(rmats_dir, output_dir, genome_file, gtf_file,
 
         global_event_counter += n_current
 
-        ok = sum(1 for r in records if r['Match_Status'] == 'OK')
-        l2 = sum(1 for r in records if '[LEVEL2]' in r['Match_Status'])
-        l1 = sum(1 for r in records if '[LEVEL1]' in r['Match_Status'])
+        ok = sum(1 for r in records if r['Match_Status'].startswith('FULL'))
+        l2 = sum(1 for r in records if r['Match_Status'].startswith('PARTIAL'))
+        l1 = sum(1 for r in records if r['Match_Status'].startswith('ANCHOR_ONLY'))
         nsc = sum(1 for r in records if 'ALT_NO_START_CODON' in r['Match_Status'])
         noncoding = sum(1 for r in records if r.get('NMD_Status', '') == 'NON_CODING')
         nmd = defaultdict(int)
@@ -343,9 +374,10 @@ def filter_and_summarize(rmats_dir, output_dir, genome_file, gtf_file,
         for r in records:
             nmd[r.get('NMD_Status', 'UNKNOWN')] += 1
             ms = r['Match_Status']
-            if ms not in ('OK',) and 'ALT_NO_START_CODON' not in ms and '[LEVEL2]' not in ms and '[LEVEL1]' not in ms:
+            if not (ms.startswith(('FULL', 'PARTIAL', 'ANCHOR_ONLY', 'NON_CODING'))
+                    or 'ALT_NO_START_CODON' in ms):
                 errs[ms] += 1
-        logger.info(f"Match levels  : OK {ok} · LEVEL2 {l2} · LEVEL1 {l1} · NO_START {nsc} · "
+        logger.info(f"Match levels  : FULL {ok} · PARTIAL {l2} · ANCHOR_ONLY {l1} · NO_START {nsc} · "
                     f"NON_CODING {noncoding} (of {len(records)})")
         nmd_str = " · ".join(f"{status or '(unmatched)'} {cnt}"
                              for status, cnt in sorted(nmd.items(), key=lambda x: -x[1]))

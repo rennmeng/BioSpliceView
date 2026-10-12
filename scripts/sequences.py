@@ -70,7 +70,13 @@ def get_exon_sequence(exon_segments, genome, chrom, strand):
         return "".join(parts)
 
 
-def extend_cds_with_3utr(cds_ph_list, genome, chrom, strand, extension_bp=None):
+def extend_cds_with_3utr(cds_ph_list, genome, chrom, strand, extension_bp=None, tx_exons=None):
+    """Append 3'UTR sequence to the CDS chain so the ORF can run through to a
+    stop codon. When tx_exons (the isoform's exon chain, 0-based half-open) is
+    provided the extension follows the SPLICED chain — jumping introns — which
+    is required for alternative isoforms; otherwise it falls back to
+    genomically contiguous extension (safe for reference CDS whose annotated
+    stop codon immediately follows the last CDS block)."""
     if extension_bp is None:
         extension_bp = ALT_DOWNSTREAM_EXTENSION_BP
     if not cds_ph_list or extension_bp <= 0:
@@ -88,6 +94,47 @@ def extend_cds_with_3utr(cds_ph_list, genome, chrom, strand, extension_bp=None):
                 cl = len(genome[k])
                 break
     cum_len = sum(e-s for s, e, _ in cds_ph_list)
+
+    if tx_exons:
+        exons = sorted(tx_exons)
+        ext_segs = []
+        remaining = extension_bp
+        if strand == '+':
+            last_e = cds_ph_list[-1][1]
+            # 当前 CDS 末端所在外显子及其后继外显子（转录本序 = 升序）
+            for i, (es, ee) in enumerate(exons):
+                if es <= last_e <= ee:
+                    if last_e < ee and remaining > 0:
+                        take = min(ee - last_e, remaining)
+                        ext_segs.append((last_e, last_e + take, cum_len % 3))
+                        remaining -= take
+                    for nes, nee in exons[i+1:]:
+                        if remaining <= 0:
+                            break
+                        take = min(nee - nes, remaining)
+                        ext_segs.append((nes, nes + take, cum_len % 3))
+                        remaining -= take
+                    break
+        else:
+            first_s = cds_ph_list[0][0]
+            for i, (es, ee) in enumerate(exons):
+                if es <= first_s <= ee:
+                    if es < first_s and remaining > 0:
+                        take = min(first_s - es, remaining)
+                        ext_segs.append((first_s - take, first_s, cum_len % 3))
+                        remaining -= take
+                    for nes, nee in reversed(exons[:i]):
+                        if remaining <= 0:
+                            break
+                        take = min(nee - nes, remaining)
+                        ext_segs.append((nee - take, nee, cum_len % 3))
+                        remaining -= take
+                    break
+        if ext_segs:
+            extended.extend(ext_segs)
+        return sorted(extended, key=lambda x: x[0])
+
+    # 无外显子链时的回退：基因组连续延伸（参考转录本注释 stop 紧邻 CDS 末端时安全）
     if strand == '+':
         last_e = cds_ph_list[-1][1]
         ext_end = min(last_e + extension_bp, cl) if cl > 0 else last_e + extension_bp

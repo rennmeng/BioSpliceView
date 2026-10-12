@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Run BioSplice on the bundled mini dataset.
+"""Run BioSpliceView on the bundled mini dataset.
 
 Equivalent command line (run from the project root):
 

@@ -4,9 +4,14 @@
 
 Two GenBank records are written per event:
   - EXON-*.gb : mRNA sequence spliced from the reference transcript exons
-                (exon/CDS features plus event-region annotations)
+                (exon/CDS features plus event-landmark misc_features)
   - Tran-*.gb : genomic sequence spanned by the reference transcript
-                (exon/CDS features plus event-region annotations)
+                (exon/CDS features plus event-landmark misc_features)
+
+Landmark labels follow the manuscript vocabulary (anchor exons, skipped
+exon, retained intron, mutually exclusive exons, alternative splice site
+region) and every record carries a structured comment reporting the NMD
+consequence of the event and the absolute NMD status of each isoform.
 """
 
 import logging
@@ -30,8 +35,89 @@ def sanitize_filename(s: str) -> str:
     return re.sub(r'[^\w\-\.]', '_', str(s).strip())
 
 
+def _gb1(s, e):
+    """Convert a 0-based half-open interval to a 1-based inclusive string."""
+    return f"{s + 1}-{e}"
+
+
+def _nmd_comment(context, gene_symbol, etype, event_id, ref_tid):
+    """Structured record comment carrying the dual NMD report."""
+    if not context:
+        return (f"BioSpliceView {etype} event {event_id} of {gene_symbol}; "
+                f"reference transcript {ref_tid}")
+    lines = [
+        f"BioSpliceView {etype} event {event_id} of {gene_symbol}",
+        f"Reference transcript: {ref_tid}"
+        + (f" [{context.get('anchor_biotype')}]" if context.get('anchor_biotype') else ""),
+        f"NMD consequence of event: {context.get('nmd_status', 'NA')} "
+        "(Express = no PTC introduced; NMD_Target = predicted NMD-sensitive; "
+        "NMDER1/2/3 = PTC with predicted NMD escape)",
+        f"Reference isoform NMD status (absolute): {context.get('ref_abs_nmd', 'NA')}",
+        f"Alternative isoform NMD status (absolute): {context.get('alt_abs_nmd', 'NA')}",
+    ]
+    return " | ".join(lines)
+
+
+def _event_landmarks(etype, row, anchors, diff_regions, ref_exons):
+    """Build (label, note, interval) landmark triples using the manuscript
+    vocabulary. `ref_exons` decides which event form the reference realises."""
+    labels = []
+
+    def form_note(in_ref):
+        return ("present in reference isoform" if in_ref
+                else "specific to alternative isoform")
+
+    if etype == "SE":
+        if len(anchors) >= 2:
+            labels.append(("anchor exon (upstream)", "constitutive exon upstream of the event",
+                           anchors[0]))
+            labels.append(("anchor exon (downstream)", "constitutive exon downstream of the event",
+                           anchors[1]))
+        for d in diff_regions:
+            labels.append(("skipped exon",
+                           f"cassette exon; {form_note(_exon_in_ref(d, ref_exons))}", d))
+
+    elif etype == "RI":
+        if len(anchors) >= 2:
+            labels.append(("anchor exon (upstream)", "exon upstream of the retained intron",
+                           anchors[0]))
+            labels.append(("anchor exon (downstream)", "exon downstream of the retained intron",
+                           anchors[1]))
+        for d in diff_regions:
+            labels.append(("retained intron",
+                           "intron retained in the alternative isoform", d))
+
+    elif etype == "MXE":
+        if len(anchors) >= 2:
+            labels.append(("anchor exon (upstream)", "constitutive exon upstream of the event",
+                           anchors[0]))
+            labels.append(("anchor exon (downstream)", "constitutive exon downstream of the event",
+                           anchors[1]))
+        for i, d in enumerate(diff_regions):
+            labels.append((f"mutually exclusive exon {i + 1}",
+                           f"{form_note(_exon_in_ref(d, ref_exons))}", d))
+
+    elif etype in ("A5SS", "A3SS"):
+        short = (int(float(row['shortES'])), int(float(row['shortEE'])))
+        long_ = (int(float(row['longExonStart_0base'])), int(float(row['longExonEnd'])))
+        flank = (int(float(row['flankingES'])), int(float(row['flankingEE'])))
+        labels.append(("short isoform exon",
+                       f"exon using the short-form splice site; "
+                       f"{form_note(_exon_in_ref(short, ref_exons))}", short))
+        labels.append(("long isoform exon",
+                       f"exon using the long-form splice site; "
+                       f"{form_note(_exon_in_ref(long_, ref_exons))}", long_))
+        labels.append(("flanking exon", "constitutive exon flanking the event", flank))
+        for d in diff_regions:
+            labels.append(("alternative splice site region",
+                           f"sequence differing between the short and long forms of this "
+                           f"{etype} event", d))
+
+    return labels
+
+
 def generate_exon_gb(ref_tid, exon_bounds, cds_ph_list, genome, chrom, strand,
-                     gene_symbol, etype, row, output_dir, job_id, event_id=""):
+                     gene_symbol, etype, row, output_dir, job_id, event_id="", context=None):
     if not exon_bounds or not ref_tid:
         return None
     try:
@@ -52,9 +138,12 @@ def generate_exon_gb(ref_tid, exon_bounds, cds_ph_list, genome, chrom, strand,
         locus_name = f"{id_prefix}{event_id}_EXON-{etype}-{safe_gene}"
 
         record = SeqRecord(Seq(mrna_seq), id=ref_tid, name=locus_name[:16],
-                           description=f"{gene_symbol} {etype} mRNA (ID:{event_id})")
+                           description=f"{gene_symbol} {etype} event {event_id} spliced mRNA "
+                                       f"(reference isoform)")
         record.annotations["molecule_type"] = "mRNA"
         record.annotations["date"] = datetime.now().strftime("%d-%b-%Y").upper()
+        record.annotations["keywords"] = ["alternative splicing", etype, "BioSpliceView"]
+        record.annotations["comment"] = _nmd_comment(context, gene_symbol, etype, event_id, ref_tid)
 
         cum = 0
         for idx, (s, e) in enumerate(exon_bounds):
@@ -107,55 +196,25 @@ def generate_exon_gb(ref_tid, exon_bounds, cds_ph_list, genome, chrom, strand,
                     "gene": gene_symbol,
                     "transcript_id": ref_tid,
                     "codon_start": "1",
-                    "product": f"{gene_symbol} protein"
+                    "transl_table": "1",
+                    "product": f"{gene_symbol} protein (reference isoform)"
                 }
                 if translated:
                     quals["translation"] = translated
 
                 record.features.append(SeqFeature(cds_loc, type="CDS", qualifiers=quals))
         else:
-            record.annotations["comment"] = f"Non-coding RNA transcript for {gene_symbol}"
+            base_comment = record.annotations.get("comment", "")
+            record.annotations["comment"] = (
+                f"{base_comment} | Non-coding RNA transcript for {gene_symbol}")
 
         try:
             anchors, diff_regions = _extract_event_regions(row, etype)
-            event_labels = []
-            if etype == "SE":
-                if len(anchors) >= 2:
-                    event_labels.append(("Upstream_Anchor_Exon", anchors[0]))
-                    event_labels.append(("Downstream_Anchor_Exon", anchors[1]))
-                for d in diff_regions:
-                    lbl = "Skipped_Exon_IN_WT" if _exon_in_ref(d, exon_bounds) else "Skipped_Exon_ALT_FORM"
-                    event_labels.append((lbl, d))
-            elif etype == "RI":
-                if len(anchors) >= 2:
-                    event_labels.append(("Upstream_Exon", anchors[0]))
-                    event_labels.append(("Downstream_Exon", anchors[1]))
-                for d in diff_regions:
-                    event_labels.append(("Retained_Intron_REGION", d))
-            elif etype == "MXE":
-                if len(anchors) >= 2:
-                    event_labels.append(("Upstream_Exon", anchors[0]))
-                    event_labels.append(("Downstream_Exon", anchors[1]))
-                for i, d in enumerate(diff_regions):
-                    in_wt = _exon_in_ref(d, exon_bounds)
-                    lbl = f"Exon{i + 1}_Candidate_IN_WT" if in_wt else f"Exon{i + 1}_Candidate_ALT_FORM"
-                    event_labels.append((lbl, d))
-            elif etype in ("A5SS", "A3SS"):
-                short = (int(float(row['shortES'])), int(float(row['shortEE'])))
-                long_ = (int(float(row['longExonStart_0base'])), int(float(row['longExonEnd'])))
-                flank = (int(float(row['flankingES'])), int(float(row['flankingEE'])))
+            event_labels = _event_landmarks(etype, row, anchors, diff_regions, exon_bounds)
 
-                short_in_wt = _exon_in_ref(short, exon_bounds)
-                long_in_wt = _exon_in_ref(long_, exon_bounds)
-                s_label = "Short_Exon_IN_WT" if short_in_wt else "Short_Exon_ALT_FORM"
-                l_label = "Long_Exon_IN_WT" if long_in_wt else "Long_Exon_ALT_FORM"
-                event_labels.append((s_label, short))
-                event_labels.append((l_label, long_))
-                event_labels.append(("Flanking_Exon", flank))
-                for d in diff_regions:
-                    event_labels.append(("Alt_SS_DIFF_Region", d))
-
-            for label, (gs, ge) in event_labels:
+            for label, note_text, (gs, ge) in event_labels:
+                if gs >= ge:  # zero-length region (e.g. A3SS/A5SS with identical sites)
+                    continue
                 rel_parts = []
                 c = 0
                 found = False
@@ -183,11 +242,15 @@ def generate_exon_gb(ref_tid, exon_bounds, cds_ph_list, genome, chrom, strand,
                     feat_loc = locs[0] if len(locs) == 1 else CompoundLocation(locs)
                     record.features.append(SeqFeature(
                         feat_loc, type="misc_feature",
-                        qualifiers={"label": label, "note": f"event={etype};genomic={chrom}:{gs}-{ge}"}))
+                        qualifiers={
+                            "label": label,
+                            "note": f"{etype} landmark; {note_text}; "
+                                    f"genomic {chrom}:{_gb1(gs, ge)} (1-based)"}))
                 else:
                     existing_note = record.annotations.get("comment", "")
-                    add_note = f"{label}: {chrom}:{gs}-{ge} (not in this WT transcript)"
-                    record.annotations["comment"] = f"{existing_note}; {add_note}" if existing_note else add_note
+                    add_note = f"{label}: {chrom}:{_gb1(gs, ge)} (not present in this reference transcript)"
+                    record.annotations["comment"] = (f"{existing_note}; {add_note}"
+                                                     if existing_note else add_note)
         except Exception as e:
             logger.debug(f"EXON-GB misc_feature annotation failed: {e}")
 
@@ -201,7 +264,7 @@ def generate_exon_gb(ref_tid, exon_bounds, cds_ph_list, genome, chrom, strand,
 
 
 def generate_tran_gb(ref_tid, full_tx_exons, cds_ph_list, genome, chrom, strand,
-                     gene_symbol, etype, row, output_dir, job_id, event_id=""):
+                     gene_symbol, etype, row, output_dir, job_id, event_id="", context=None):
     if not ref_tid:
         return None
     try:
@@ -234,9 +297,12 @@ def generate_tran_gb(ref_tid, full_tx_exons, cds_ph_list, genome, chrom, strand,
         locus_name = f"{id_prefix}{event_id}_Tran-{etype}-{safe_gene}"
 
         record = SeqRecord(Seq(display_seq), id=ref_tid, name=locus_name[:16],
-                           description=f"{gene_symbol} {etype} genomic (ID:{event_id})")
+                           description=f"{gene_symbol} {etype} event {event_id} genomic context "
+                                       f"(reference transcript)")
         record.annotations["molecule_type"] = "DNA"
         record.annotations["date"] = datetime.now().strftime("%d-%b-%Y").upper()
+        record.annotations["keywords"] = ["alternative splicing", etype, "BioSpliceView"]
+        record.annotations["comment"] = _nmd_comment(context, gene_symbol, etype, event_id, ref_tid)
 
         if full_tx_exons:
             n_exons = len(full_tx_exons)
@@ -277,45 +343,16 @@ def generate_tran_gb(ref_tid, full_tx_exons, cds_ph_list, genome, chrom, strand,
                 record.features.append(SeqFeature(
                     cds_loc, type="CDS",
                     qualifiers={"gene": gene_symbol, "transcript_id": ref_tid,
-                                "codon_start": "1", "product": f"{gene_symbol} protein"}))
+                                "codon_start": "1", "transl_table": "1",
+                                "product": f"{gene_symbol} protein (reference isoform)"}))
 
         try:
             anchors, diff_regions = _extract_event_regions(row, etype)
-            event_labels = []
-            if etype == "SE":
-                if len(anchors) >= 2:
-                    event_labels.append(("Upstream_Anchor", anchors[0]))
-                    event_labels.append(("Downstream_Anchor", anchors[1]))
-                for d in diff_regions:
-                    event_labels.append(("Skipped_Exon_DIFF", d))
-            elif etype == "RI":
-                if len(anchors) >= 2:
-                    event_labels.append(("Upstream_Exon", anchors[0]))
-                    event_labels.append(("Downstream_Exon", anchors[1]))
-                for d in diff_regions:
-                    event_labels.append(("Retained_Intron_DIFF", d))
-            elif etype == "MXE":
-                event_labels = []
-                if len(anchors) >= 2:
-                    event_labels.append(("Upstream_Exon", anchors[0]))
-                    event_labels.append(("Downstream_Exon", anchors[1]))
-                for i, d in enumerate(diff_regions):
-                    in_wt = _exon_in_ref(d, full_tx_exons)
-                    lbl = f"Exon{i + 1}_Candidate_IN_WT" if in_wt else f"Exon{i + 1}_Candidate_ALT_FORM"
-                    event_labels.append((lbl, d))
-            elif etype in ("A5SS", "A3SS"):
-                short = (int(float(row['shortES'])), int(float(row['shortEE'])))
-                long_ = (int(float(row['longExonStart_0base'])), int(float(row['longExonEnd'])))
-                flank = (int(float(row['flankingES'])), int(float(row['flankingEE'])))
+            event_labels = _event_landmarks(etype, row, anchors, diff_regions, full_tx_exons)
 
-                short_in_wt = _exon_in_ref(short, full_tx_exons)
-                long_in_wt = _exon_in_ref(long_, full_tx_exons)
-                s_label = "Short_Exon_IN_WT" if short_in_wt else "Short_Exon_ALT_FORM"
-                l_label = "Long_Exon_IN_WT" if long_in_wt else "Long_Exon_ALT_FORM"
-                event_labels = [(s_label, short), (l_label, long_), ("Flanking_Exon", flank)]
-                for d in diff_regions:
-                    event_labels.append(("Alt_SS_DIFF", d))
-            for label, (gs, ge) in event_labels:
+            for label, note_text, (gs, ge) in event_labels:
+                if gs >= ge:
+                    continue
                 cs = max(gene_start, min(gene_end, gs))
                 ce = max(gene_start, min(gene_end, ge))
                 if cs < ce:
@@ -325,7 +362,10 @@ def generate_tran_gb(ref_tid, full_tx_exons, cds_ph_list, genome, chrom, strand,
                     record.features.append(SeqFeature(
                         FeatureLocation(rel_s, rel_e, strand=feat_strand),
                         type="misc_feature",
-                        qualifiers={"label": label, "note": f"event={etype}"}))
+                        qualifiers={
+                            "label": label,
+                            "note": f"{etype} landmark; {note_text}; "
+                                    f"genomic {chrom}:{_gb1(gs, ge)} (1-based)"}))
         except Exception as e:
             logger.debug(f"Tran-GB misc_feature annotation failed: {e}")
 

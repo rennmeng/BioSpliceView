@@ -4,7 +4,7 @@
 
 Match levels:
   3 = FULL             (SE: up-skip-dn adjacent in order; RI: up-dn adjacent with a cleanly retained intron)
-  2 = LEVEL2_PARTIAL   (regions match exactly but adjacency is not satisfied, etc.)
+  2 = PARTIAL          (regions match exactly but adjacency is not satisfied, etc.)
   1 = ANCHOR_ONLY      (only a single anchor region matches)
   0 = NONE             (no match)
 """
@@ -13,8 +13,14 @@ import logging
 from collections import defaultdict
 
 from .events import _extract_event_regions
+from .nmd import transcript_self_nmd
 
 logger = logging.getLogger(__name__)
+
+# Transcript biotypes that the annotation itself marks as NMD substrates.
+# BioSpliceView assumes the anchor (reference) transcript is normally expressed,
+# so such transcripts must not be preferred as anchors.
+NMD_BIOTYPES = {'nonsense_mediated_decay'}
 
 
 def _check_boundary_match(query_region, tx_exons, mode='exact'):
@@ -201,7 +207,7 @@ def _classify_match_v324(tx_exons, anchors, diff_regions, etype, row=None):
                 return 3, "FULL", f"all_3_exact+{adj_detail}"
             else:
                 # All present but not consecutive -> downgrade
-                return 2, "LEVEL2_PARTIAL", f"all_3_exact_but_{adj_detail}"
+                return 2, "PARTIAL", f"all_3_exact_but_{adj_detail}"
 
         if exact_count == 2:
             # Check for up-skip or skip-dn adjacency (partial match)
@@ -213,24 +219,24 @@ def _classify_match_v324(tx_exons, anchors, diff_regions, etype, row=None):
                 # up-skip adjacent, dn missing
                 if dn_idx >= 0 and dn_idx == skip_idx + 1:
                     return 3, "FULL", "up_skip_dn_adjacent(partial_exact)"
-                return 2, "LEVEL2_PARTIAL", "up_skip_adjacent;dn_missing"
+                return 2, "PARTIAL", "up_skip_adjacent;dn_missing"
 
             if skip_exact and dn_exact and _are_adjacent_in_tx(skip_idx, dn_idx, tx_exons_sorted):
                 # skip-dn adjacent, up missing
                 if up_idx >= 0 and skip_idx == up_idx + 1:
                     return 3, "FULL", "up_skip_dn_adjacent(partial_exact)"
-                return 2, "LEVEL2_PARTIAL", "skip_dn_adjacent;up_missing"
+                return 2, "PARTIAL", "skip_dn_adjacent;up_missing"
 
             if up_exact and dn_exact and _are_adjacent_in_tx(up_idx, dn_idx, tx_exons_sorted):
                 # up-dn adjacent with the exon skipped (alt form of an SE event)
-                return 2, "LEVEL2_PARTIAL", "up_dn_adjacent(skip_skipped_form)"
+                return 2, "PARTIAL", "up_dn_adjacent(skip_skipped_form)"
 
             # Fallback: 2 exact matches but not adjacent
             matched = []
             if up_exact: matched.append("up")
             if skip_exact: matched.append("skip")
             if dn_exact: matched.append("dn")
-            return 2, "LEVEL2_PARTIAL", f"2_exact({'+'.join(matched)});not_adjacent"
+            return 2, "PARTIAL", f"2_exact({'+'.join(matched)});not_adjacent"
 
         if exact_count == 1:
             return 1, "ANCHOR_ONLY", f"1_exact_only"
@@ -262,9 +268,9 @@ def _classify_match_v324(tx_exons, anchors, diff_regions, etype, row=None):
                 if ri_clean:
                     return 3, "FULL", f"up_dn_adjacent+ri_clean"
                 else:
-                    return 2, "LEVEL2_PARTIAL", f"up_dn_adjacent;ri_overlaps_exon"
+                    return 2, "PARTIAL", f"up_dn_adjacent;ri_overlaps_exon"
             else:
-                return 2, "LEVEL2_PARTIAL", f"up_dn_exact_but_{adj_detail}"
+                return 2, "PARTIAL", f"up_dn_exact_but_{adj_detail}"
 
         if up_exact or dn_exact:
             matched = "up" if up_exact else "dn"
@@ -293,9 +299,9 @@ def _classify_match_v324(tx_exons, anchors, diff_regions, etype, row=None):
         if priority >= 4:
             return 3, "FULL", detail
         elif priority == 3:
-            return 2, "LEVEL2_PARTIAL", detail
+            return 2, "PARTIAL", detail
         elif priority == 2:
-            return 2, "LEVEL2_PARTIAL", detail
+            return 2, "PARTIAL", detail
         elif priority == 1:
             return 1, "ANCHOR_ONLY", detail
         else:
@@ -327,7 +333,7 @@ def _classify_match_v324(tx_exons, anchors, diff_regions, etype, row=None):
 
         if (short_exact or long_exact) and flank_boundary_ok:
             iso = "short" if short_exact else "long"
-            return 2, "LEVEL2_PARTIAL", f"{iso}_exact+flank_boundary({flank_boundary_type})"
+            return 2, "PARTIAL", f"{iso}_exact+flank_boundary({flank_boundary_type})"
 
         if short_exact or long_exact:
             iso = "short" if short_exact else "long"
@@ -342,8 +348,31 @@ def _classify_match_v324(tx_exons, anchors, diff_regions, etype, row=None):
         return 0, "NONE", "no_match"
 
 
-def anchor_ref_transcript(row, etype, gene_sym, gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene):
+def _anchor_safety(tid, cds_list, tx_exons, strand, tid_biotype):
+    """Anchor safety tier of a coding candidate transcript.
+    0 = safe (coding biotype, stop codon not NMD-sensitive by our own rules)
+    1 = coding biotype but its annotated stop looks NMD-sensitive (e.g. long 3'UTR)
+    2 = annotation itself marks the transcript as an NMD substrate
+    """
+    bt = (tid_biotype or {}).get(tid, '')
+    if bt in NMD_BIOTYPES:
+        return 2
+    try:
+        if transcript_self_nmd(cds_list, tx_exons, strand):
+            return 1
+    except Exception:  # never let the safety check break anchoring
+        pass
+    return 0
+
+
+def anchor_ref_transcript(row, etype, gene_sym, gene_idx, gene_exons, tid_strand, alias_map,
+                          longest_tx_per_gene, tid_biotype=None):
     """Anchor the event's reference transcript in the annotation.
+
+    Candidates within the same match level are preferred in the order:
+    (a) not NMD-annotated and not self-NMD, (b) not NMD-annotated but self-NMD,
+    (c) NMD-annotated (kept only as a fallback and flagged in the status).
+    Within each tier the longest total CDS wins, as before.
 
     Returns (transcript_id, cds_segments, exon_segments, strand, status_message).
     """
@@ -373,15 +402,15 @@ def anchor_ref_transcript(row, etype, gene_sym, gene_idx, gene_exons, tid_strand
         if has_exon:
             for tid, exons in gene_exons[canonical].items():
                 if exons:
-                    return tid, [], exons, '+', f"[LEVEL2] NON_CODING_RNA(gene={canonical})"
-        return None, [], [], '+', f"[LEVEL0] GENE_NOT_FOUND(symbol={sym};canonical={canonical})"
+                    return tid, [], exons, '+', f"NON_CODING_RNA(gene={canonical})"
+        return None, [], [], '+', f"UNANCHORED(GENE_NOT_FOUND;symbol={sym};canonical={canonical})"
 
     try:
         anchors, diff_regions = _extract_event_regions(row, etype)
     except KeyError as e:
-        return None, [], [], '+', f"[LEVEL0] MISSING_COLUMN({e})"
+        return None, [], [], '+', f"UNANCHORED(MISSING_COLUMN;{e})"
     if not anchors and not diff_regions:
-        return None, [], [], '+', "[LEVEL0] NO_EVENT_REGIONS_PARSED"
+        return None, [], [], '+', "UNANCHORED(NO_EVENT_REGIONS_PARSED)"
 
     buckets = defaultdict(list)
     noncoding_buckets = defaultdict(list)
@@ -403,14 +432,25 @@ def anchor_ref_transcript(row, etype, gene_sym, gene_idx, gene_exons, tid_strand
 
     for lv in [3, 2, 1]:
         if buckets[lv]:
-            best = max(buckets[lv], key=lambda x: sum(e-s for s, e, _ in x[1]))
+            scored = [
+                (_anchor_safety(tid, cds, exons, tid_strand.get(tid, '+'), tid_biotype), entry)
+                for entry in buckets[lv]
+                for tid, cds, exons, detail in [entry]
+            ]
+            best_tier = min(t for t, _ in scored)
+            pool = [entry for t, entry in scored if t == best_tier]
+            best = max(pool, key=lambda x: sum(e - s for s, e, _ in x[1]))
             tid, cds, exons, detail = best
             if lv == 3:
-                status = "OK"
+                status = "FULL"
             elif lv == 2:
-                status = f"[LEVEL2] PARTIAL({detail})"
+                status = f"PARTIAL({detail})"
             else:
-                status = f"[LEVEL1] ANCHOR_ONLY({detail})"
+                status = f"ANCHOR_ONLY({detail})"
+            if best_tier == 1:
+                status += ";ANCHOR_SELF_NMD"
+            elif best_tier == 2:
+                status += ";ANCHOR_NMD_BIOTYPE"
             return tid, cds, exons, tid_strand.get(tid, '+'), status
 
     for lv in [3, 2, 1]:
@@ -420,6 +460,6 @@ def anchor_ref_transcript(row, etype, gene_sym, gene_idx, gene_exons, tid_strand
             tx_exons = gene_exons.get(canonical, {}).get(tid, [])
             detail = entries[0][1] if len(entries[0]) > 1 else ""
             lv_label = {3: "NON_CODING_FULL", 2: "NON_CODING_PARTIAL", 1: "NON_CODING_ANCHOR"}[lv]
-            return tid, [], tx_exons, tid_strand.get(tid, '+'), f"[LEVEL2] {lv_label}({detail})"
+            return tid, [], tx_exons, tid_strand.get(tid, '+'), f"{lv_label}({detail})"
 
-    return None, [], [], '+', f"[LEVEL0] PRECISE_MATCH_FAIL(gene={canonical};n_tx={len(candidates)})"
+    return None, [], [], '+', f"UNANCHORED(PRECISE_MATCH_FAIL;gene={canonical};n_tx={len(candidates)})"

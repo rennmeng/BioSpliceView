@@ -1,4 +1,4 @@
-# BioSplice
+# BioSpliceView
 
 <p align="center">
   <b>Annotation of rMATS alternative splicing events at the isoform level</b><br>
@@ -10,7 +10,7 @@
   <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
-**BioSplice** annotates significant alternative splicing events (SE / RI / A3SS / A5SS / MXE) detected by
+**BioSpliceView** annotates significant alternative splicing events (SE / RI / A3SS / A5SS / MXE) detected by
 [rMATS](http://rnaseq-mats.sourceforge.net/): it anchors every event onto the reference transcriptome,
 reconstructs the reference- and alternative-isoform CDS/protein sequences, classifies NMD sensitivity, and
 writes a summary Excel workbook plus per-event GenBank records.
@@ -18,14 +18,14 @@ writes a summary Excel workbook plus per-event GenBank records.
 ## Quick start
 
 ```bash
-git clone https://github.com/rennmeng/BioSplice.git
-cd BioSplice
+git clone https://github.com/rennmeng/BioSpliceView.git
+cd BioSpliceView
 pip install -r requirements.txt    # pandas, openpyxl, pyfaidx, biopython (Python 3.8+)
 python example.py                  # runs the bundled mini dataset end-to-end in seconds
 ```
 
 Results are written to `results_example/Job_mini/`: `Job_mini_results.xlsx` plus two GenBank records per event
-under `GB_Files/`. Optionally, `pip install .` provides the `biosplice` console command.
+under `GB_Files/`. Optionally, `pip install .` provides the `biospliceview` console command.
 
 ## Usage
 
@@ -51,21 +51,46 @@ python main.py \
 | `--minjc` | Minimum junction count (default `15`) — exclude events whose IJC **and** SJC averages are too low in both samples |
 
 Optional flags: `--no-gb` (skip GenBank output) and `--no-cache` / `--cache-dir` (GTF index cache control).
-Default directories can also be set via the environment variables `SPLICE_GTF_CACHE_DIR` / `SPLICE_ALLGTF_DIR`.
+The default cache directory can also be set via the environment variable `SPLICE_GTF_CACHE_DIR`.
 
 ## Output
 
 `<output>/Job_<id>/Job_<id>_results.xlsx` contains one sheet per event type plus an `All_Significant` summary.
-The raw rMATS columns are kept and 12 annotation columns are appended:
+The raw rMATS columns are kept and 14 annotation columns are appended:
 
 | Column | Meaning |
 |--------|---------|
 | `Ref_Transcript_ID` | anchored reference transcript |
+| `Anchor_Biotype` | annotation biotype of the anchor (e.g. `protein_coding`, `nonsense_mediated_decay`) |
 | `Ref_Full_CDS` / `Ref_Full_Protein` / `Ref_CDS_Length` | reference isoform, truncated at the first stop codon found after extending into the 3'UTR |
 | `Alt_Full_CDS` / `Alt_Full_Protein` / `Alt_CDS_Length` | alternative isoform; empty and flagged `ALT_NO_START_CODON` if it does not start on ATG |
 | `Diff_CDS` / `Diff_Protein` / `Diff_Length` | difference segments after trimming common prefixes/suffixes (`ref\|alt` format) |
-| `NMD_Status` | `Express` / `NMD_Target` / `NMD_Escape_1/2/3` / `NO_START_CODON` / `NON_CODING` / ... |
-| `Match_Status` | `OK` / `[LEVEL2] PARTIAL(...)` / `[LEVEL1] ANCHOR_ONLY(...)` / `[LEVEL0] ...` |
+| `NMD_Status` | **event consequence** — whether the event itself introduces a PTC: `Express` (frame-preserving / protein identical) · `NMD_Target` · `NMDER1/2/3` (PTC predicted to escape NMD) · `NO_START_CODON` · `NON_CODING` |
+| `Ref_Absolute_NMD` / `Alt_Absolute_NMD` | **absolute NMD status of each isoform's own stop codon** (`Normal` / `NMD_Target` / `NMDER1/2/3`), independent of the event — reveals isoforms that are already NMD substrates in the annotation |
+| `Match_Status` | `FULL` / `PARTIAL(...)` / `ANCHOR_ONLY(...)` / `NON_CODING*` / `UNANCHORED(...)`; anchor warnings are appended as `;ANCHOR_SELF_NMD` / `;ANCHOR_NMD_BIOTYPE` |
+
+### Dual NMD reporting
+
+`NMD_Status` answers *"does this event introduce a premature stop codon relative to the
+reference isoform?"* — the question an experimenter usually asks. `Ref_Absolute_NMD` /
+`Alt_Absolute_NMD` answer *"is this isoform itself an NMD substrate according to its own
+stop-codon position?"*. The two can legitimately disagree: e.g. an in-frame event on an
+NMD-annotated reference yields `NMD_Status = Express` (no new PTC) while
+`Alt_Absolute_NMD = NMD_Target` (the isoform, like its reference, remains NMD-sensitive).
+
+NMD escape subclasses follow the manuscript definitions:
+`NMDER1` PTC < 150 nt downstream of the start codon · `NMDER2` PTC > 400 nt from the next
+downstream exon-junction complex · `NMDER3` PTC within the last exon or ≤ 50 nt upstream of
+the terminal exon–exon junction. All distances are measured in transcript orientation
+(strand-aware).
+
+### Anchor preference
+
+Within the same match level, candidate anchors are preferred in the order
+(1) not NMD-annotated and stop codon not NMD-sensitive, (2) not NMD-annotated but
+self-NMD, (3) NMD-annotated (kept only when no safer candidate realises the event and
+flagged `;ANCHOR_NMD_BIOTYPE`). This keeps BioSpliceView's assumption — the reference
+transcript is normally expressed — explicit and auditable.
 
 ## How events are matched
 
@@ -74,8 +99,16 @@ The raw rMATS columns are kept and 12 annotation columns are appended:
 - **MXE**: both flanks present, only one mutually exclusive exon, adjacency preferred
 - **A5SS/A3SS**: short/long exon + flanking exon boundary matching
 
-Every event is graded `OK` / `LEVEL2 PARTIAL` / `LEVEL1 ANCHOR_ONLY` / `LEVEL0`, and frameshift events are
-further classified for NMD sensitivity by the 50–55 nt rule (`NMD_Target` / `NMD_Escape_1/2/3`).
+Every event is graded `FULL` / `PARTIAL` / `ANCHOR_ONLY` / `NON_CODING` / `UNANCHORED`, and frameshift events are
+further classified for NMD sensitivity by the canonical EJC rules (`NMD_Target` / `NMDER1/2/3`).
+
+## GenBank output
+
+Per event, two records are written under `GB_Files/`: `EXON-*.gb` (spliced mRNA view) and
+`Tran-*.gb` (genomic view with introns). Records carry exon/CDS features (`transl_table=1`),
+`misc_feature` landmarks using the manuscript vocabulary — anchor exons, skipped exon,
+retained intron, mutually exclusive exons, alternative splice site region — and a structured
+`COMMENT` block with the dual NMD report, directly openable in SnapGene or any GenBank viewer.
 
 ## Bundled mini dataset
 
@@ -92,13 +125,13 @@ examples/mini_dataset/
 ```
 
 Rerunning it reproduces the original full-genome annotation exactly: every matched event is identical on all
-annotation columns; the only difference affects 4 events that were already unmatched (`[LEVEL0]`) in the
+annotation columns; the only difference affects 4 events that were already unmatched (`UNANCHORED`) in the
 original job, which report `GENE_NOT_FOUND` instead of `PRECISE_MATCH_FAIL`.
 
 ## Project layout
 
 ```
-BioSplice/
+BioSpliceView/
 ├── main.py                # CLI entry point
 ├── example.py             # one-command demo on the bundled mini dataset
 ├── scripts/               # core package

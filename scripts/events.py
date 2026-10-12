@@ -9,10 +9,10 @@ logger = logging.getLogger(__name__)
 
 # Annotation columns appended after the raw rMATS columns in the output Excel
 ANNOTATION_COLUMNS = [
-    'Ref_Transcript_ID', 'Ref_Full_CDS', 'Ref_Full_Protein', 'Ref_CDS_Length',
+    'Ref_Transcript_ID', 'Anchor_Biotype', 'Ref_Full_CDS', 'Ref_Full_Protein', 'Ref_CDS_Length',
     'Alt_Full_CDS', 'Alt_Full_Protein', 'Alt_CDS_Length',
     'Diff_CDS', 'Diff_Protein', 'Diff_Length',
-    'NMD_Status', 'Match_Status'
+    'NMD_Status', 'Ref_Absolute_NMD', 'Alt_Absolute_NMD', 'Match_Status'
 ]
 
 # Coordinate columns of the rMATS output (selected per event type)
@@ -64,16 +64,16 @@ def _extract_event_regions(row, etype) -> Tuple[List[Tuple[int, int]], List[Tupl
         flank_es = int(float(row['flankingES']))
         flank_ee = int(float(row['flankingEE']))
 
-        if etype == "A5SS":
-            if long_es <= short_es:
-                diff_regions.append((long_es, short_es))
-            else:
-                diff_regions.append((short_es, long_es))
-        else:  # A3SS
-            if long_ee >= short_ee:
-                diff_regions.append((short_ee, long_ee))
-            else:
-                diff_regions.append((long_ee, short_ee))
+        # 可变边界随链变化（A3SS 在 + 链共享终点、在 - 链共享起点，A5SS 相反），
+        # 按几何关系判定，而不是按事件类型硬编码
+        if long_es == short_es:          # 起点共享 -> 终点可变
+            diff_regions.append((min(short_ee, long_ee), max(short_ee, long_ee)))
+        elif long_ee == short_ee:        # 终点共享 -> 起点可变
+            diff_regions.append((min(short_es, long_es), max(short_es, long_es)))
+        elif etype == "A5SS":
+            diff_regions.append((min(short_es, long_es), max(short_es, long_es)))
+        else:
+            diff_regions.append((min(short_ee, long_ee), max(short_ee, long_ee)))
 
         anchors.append((short_es, short_ee))
         anchors.append((flank_es, flank_ee))

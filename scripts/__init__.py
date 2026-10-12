@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""BioSplice — rMATS alternative splicing event annotation toolkit.
+"""BioSpliceView — rMATS alternative splicing event annotation toolkit.
 
 Split from the original single-file ``spliceproduce.py``:
 
@@ -20,7 +20,7 @@ import warnings
 
 # Translating isoform CDS whose length is not a multiple of three (frameshift
 # events, stop-codon truncation, phase carry-over) triggers Biopython's
-# "Partial codon" warning. This is expected behaviour in BioSplice - the
+# "Partial codon" warning. This is expected behaviour in BioSpliceView - the
 # partial codon is intentionally kept - so the warning is silenced here.
 warnings.filterwarnings("ignore", message=".*Partial codon.*")
 

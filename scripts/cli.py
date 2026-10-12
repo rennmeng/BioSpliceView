@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        prog='biosplice',
-        description='BioSplice — annotate rMATS alternative splicing events '
+        prog='biospliceview',
+        description='BioSpliceView — annotate rMATS alternative splicing events '
                     '(adjacency-aware transcript matching)')
     p.add_argument('-r', '--rmats-dir', required=True, help='rMATS output directory')
     p.add_argument('-g', '--genome', required=True, help='genome FASTA file')
@@ -44,7 +44,7 @@ def main(argv=None):
     cache_note = ('disabled' if args.no_cache
                   else f"on ({args.cache_dir or settings.GTF_CACHE_DIR})")
     print(console.banner(
-        title=f"BioSplice v{__version__}",
+        title=f"BioSpliceView v{__version__}",
         subtitle="rMATS alternative splicing annotation · adjacency-aware matching",
         rows=[
             ("rMATS dir", args.rmats_dir),

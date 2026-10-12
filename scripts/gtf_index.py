@@ -8,7 +8,11 @@ Index structure:
   tid_strand {transcript_id: strand}
   alias_map  {alias(gene_name/gene_id/gene): canonical_gene}
   longest_tx_per_gene {canonical_gene: (transcript_id, cds_length)}
+  tid_biotype {transcript_id: transcript_type}   # e.g. protein_coding / nonsense_mediated_decay
 """
+
+# Bump when the cached tuple layout changes so stale caches are never loaded
+_INDEX_FORMAT_VERSION = 2
 
 import gzip
 import hashlib
@@ -35,7 +39,7 @@ def build_gtf_index_with_cache(gtf_file: str, cache_dir: str = None):
 
     os.makedirs(cache_dir, exist_ok=True)
     cache_key = get_gtf_cache_key(gtf_file)
-    cache_file = os.path.join(cache_dir, f'gtf_index_{cache_key}.pkl')
+    cache_file = os.path.join(cache_dir, f'gtf_index_{cache_key}_v{_INDEX_FORMAT_VERSION}.pkl')
     temp_cache_file = cache_file + '.tmp'
 
     logger.debug(f"Cache directory: {cache_dir}")
@@ -54,7 +58,7 @@ def build_gtf_index_with_cache(gtf_file: str, cache_dir: str = None):
             logger.info(f"Loading cached GTF index ({file_size/1024/1024:.1f} MB) ...")
             try:
                 with open(cache_file, 'rb') as f:
-                    gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene = pickle.load(f)
+                    gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene, tid_biotype = pickle.load(f)
 
                 if not gene_idx or len(gene_idx) == 0:
                     raise ValueError("Loaded empty gene index")
@@ -64,7 +68,7 @@ def build_gtf_index_with_cache(gtf_file: str, cache_dir: str = None):
                 logger.info(f"✓ GTF index: {len(gene_idx):,} genes · {total_tx:,} transcripts · "
                             f"{total_exons:,} exons (from cache)")
 
-                return gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene
+                return gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene, tid_biotype
             except (pickle.UnpicklingError, EOFError, ValueError, KeyError, AttributeError) as e:
                 logger.warning(f"❌ Cache load failed: {e}, rebuilding...")
                 try:
@@ -83,18 +87,18 @@ def build_gtf_index_with_cache(gtf_file: str, cache_dir: str = None):
 
     logger.info("Building GTF index (this may take a while) ...")
     start_time = datetime.now()
-    gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene = build_gtf_index(gtf_file)
+    gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene, tid_biotype = build_gtf_index(gtf_file)
     elapsed = (datetime.now() - start_time).total_seconds()
     logger.info(f"GTF index built in {elapsed:.1f}s")
 
     if not gene_idx or len(gene_idx) == 0:
         logger.error("Failed to build GTF index: empty result")
-        return gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene
+        return gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene, tid_biotype
 
     try:
         logger.debug(f"Saving GTF index to cache: {cache_file}")
         with open(temp_cache_file, 'wb') as f:
-            pickle.dump((gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene), f,
+            pickle.dump((gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene, tid_biotype), f,
                         protocol=pickle.HIGHEST_PROTOCOL)
 
         test_size = os.path.getsize(temp_cache_file)
@@ -116,7 +120,7 @@ def build_gtf_index_with_cache(gtf_file: str, cache_dir: str = None):
             except Exception as cleanup_err:
                 logger.warning(f"Failed to remove temporary file: {cleanup_err}")
 
-    return gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene
+    return gene_idx, gene_exons, tid_strand, alias_map, longest_tx_per_gene, tid_biotype
 
 
 def _default_gene_dict():
@@ -127,12 +131,13 @@ def build_gtf_index(gtf_file: str):
     gene_idx = defaultdict(_default_gene_dict)
     gene_exons = defaultdict(_default_gene_dict)
     tid_strand = {}
+    tid_biotype = {}
     alias_map = {}
     tx_cds_len = defaultdict(int)
 
     if not gtf_file or not os.path.exists(gtf_file):
         logger.error(f"GTF file not found: {gtf_file}")
-        return {}, {}, {}, {}, {}
+        return {}, {}, {}, {}, {}, {}
 
     logger.debug(f"Parsing GTF: {gtf_file}")
     opener = gzip.open if str(gtf_file).endswith('.gz') else open
@@ -158,6 +163,11 @@ def build_gtf_index(gtf_file: str):
             canonical = gene_name or gene_alt or gene_id
             if not tid or not canonical:
                 continue
+
+            if ft in ('transcript', 'exon', 'CDS', 'stop_codon', 'start_codon', 'UTR'):
+                bt = attrs.get('transcript_type', attrs.get('transcript_biotype', ''))
+                if bt and tid not in tid_biotype:
+                    tid_biotype[tid] = bt
 
             start_0 = int(p[3]) - 1
             end_0 = int(p[4])
@@ -218,7 +228,7 @@ def build_gtf_index(gtf_file: str):
     for gene, transcripts in gene_exons.items():
         gene_exons_dict[gene] = dict(transcripts)
 
-    return gene_idx_dict, gene_exons_dict, tid_strand, alias_map, longest_tx_per_gene
+    return gene_idx_dict, gene_exons_dict, tid_strand, alias_map, longest_tx_per_gene, tid_biotype
 
 
 def parse_gtf_attrs(attr_string: str) -> dict:
